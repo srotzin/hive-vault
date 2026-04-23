@@ -14,6 +14,8 @@ FENR Edition upgrades:
   1. Balance Obfuscation — display offset hides real balance from scrapers
   2. smsh DID — vault registers as did:hive:vault:fenr on pulse.smsh
   3. Quantum-Resistant Authorization — CRYSTALS-Dilithium2 drip signatures
+  4. Blacklist Descension System — COMPROMISED → BLACKLISTED → DEAD
+  5. Drip Fee — $0.003 deducted per approved drip authorization
 """
 
 import os, time, uuid, asyncio, json, hashlib, hmac, base64
@@ -182,6 +184,9 @@ TIER_DRIP_LIMITS = {
 }
 DEFAULT_DRIP_LIMIT = 0.10
 
+# ── UPGRADE 5: Drip Fee ───────────────────────────────────────────────────────
+DRIP_FEE_USDC = 0.003  # $0.003 deducted from every approved drip authorization
+
 # In-memory ledger (persisted to disk)
 LEDGER_FILE = "/tmp/hivevault_ledger.json"
 ledger: list = []
@@ -212,6 +217,71 @@ def ledger_entry(type: str, data: dict):
     ledger.append(entry)
     save_ledger()
     return entry
+
+# ── UPGRADE 4: Blacklist Descension System ───────────────────────────────────
+BLACKLIST_FILE = "/tmp/hivevault_blacklist.json"
+BLACKLIST_TIERS = ["COMPROMISED", "BLACKLISTED", "DEAD"]
+
+# In-memory blacklist: { address: { status, reason, drip_ids, flagged_at, evidence_tx } }
+blacklist: dict = {}
+
+# Pre-loaded known bad actor
+_PRELOAD_BLACKLIST = {
+    "0x2dCDEA8a708f1FDECA5e2E59d4cb70Bd2E9BdEC8": {
+        "status":      "COMPROMISED",
+        "reason":      "Swept $25 USDC marked capital from Hive2 agent wallet via Multicall3 aggregation on 2026-04-23T09:26:43Z",
+        "drip_ids":    [],
+        "flagged_at":  "2026-04-23T10:00:00Z",
+        "evidence_tx": "0x0a052a9035148e288257450e7d8321bc64f31ecf86032ca882dade42b92bb2bd",
+    }
+}
+
+def load_blacklist():
+    global blacklist
+    try:
+        with open(BLACKLIST_FILE) as f:
+            blacklist = json.load(f)
+    except Exception:
+        blacklist = {}
+    # Ensure pre-loaded entry always present (merge, don't overwrite if escalated)
+    for addr, entry in _PRELOAD_BLACKLIST.items():
+        if addr not in blacklist:
+            blacklist[addr] = entry
+    save_blacklist()
+
+def save_blacklist():
+    try:
+        with open(BLACKLIST_FILE, "w") as f:
+            json.dump(blacklist, f)
+    except Exception:
+        pass
+
+async def _broadcast_pheromone(address: str, entry: dict):
+    """Fire-and-forget broadcast to HiveForge pheromones."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                "https://hiveforge-lhu4.onrender.com/v1/pheromones",
+                json={
+                    "type":        "blacklist",
+                    "address":     address,
+                    "status":      entry.get("status"),
+                    "reason":      entry.get("reason"),
+                    "evidence_tx": entry.get("evidence_tx"),
+                    "flagged_at":  entry.get("flagged_at"),
+                    "drip_ids":    entry.get("drip_ids", []),
+                    "source":      "hivevault",
+                },
+            )
+    except Exception:
+        pass
+
+def _get_blacklist_status(address: str) -> Optional[str]:
+    """Return blacklist status for an address, or None if not listed."""
+    entry = blacklist.get(address)
+    if entry:
+        return entry.get("status")
+    return None
 
 # ── RPC helpers ──────────────────────────────────────────────────────────────
 async def get_usdc_balance(address: str) -> float:
@@ -254,6 +324,12 @@ class QuantumVerifyRequest(BaseModel):
     amount_usdc: float
     expires_at_unix: int
     quantum_sig: str
+
+class BlacklistFlagRequest(BaseModel):
+    address: str
+    reason: str
+    drip_ids: Optional[list] = []
+    evidence_tx: Optional[str] = None
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 def require_vault_key(x_vault_key: str = Header(None), x_hive_key: str = Header(None)):
@@ -324,11 +400,26 @@ async def request_drip(req: DripRequest,
     Agent requests capital for one task.
     Vault releases only what's needed — never more than tier limit.
     Drip authorization is signed with CRYSTALS-Dilithium2 (post-quantum).
+    $0.003 drip fee is deducted from the approved amount.
     """
     # Auth
     key = x_vault_key or x_hive_key
     if key not in (VAULT_KEY, HIVE_KEY):
         raise HTTPException(status_code=401, detail="Invalid vault key")
+
+    # ── UPGRADE 4: Blacklist gate ────────────────────────────────────────────
+    bl_status = _get_blacklist_status(req.agent_address)
+    blacklist_warning = None
+
+    if bl_status == "DEAD":
+        # Reject silently — do not log the attempt
+        raise HTTPException(status_code=403, detail=f"Address {req.agent_address} is DEAD. Drip permanently denied.")
+
+    if bl_status == "BLACKLISTED":
+        raise HTTPException(status_code=403, detail=f"Address {req.agent_address} is BLACKLISTED. Drip denied.")
+
+    if bl_status == "COMPROMISED":
+        blacklist_warning = f"WARNING: Address {req.agent_address} is COMPROMISED. Drip allowed but flagged."
 
     # Tier limit
     tier      = (req.tier or "VOID").upper()
@@ -338,12 +429,21 @@ async def request_drip(req: DripRequest,
     if approved_amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid budget")
 
+    # ── UPGRADE 5: Drip fee ──────────────────────────────────────────────────
+    gross_amount = approved_amount
+    net_amount   = round(approved_amount - DRIP_FEE_USDC, 6)
+    if net_amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Approved amount ${approved_amount:.6f} too small after ${DRIP_FEE_USDC} drip fee."
+        )
+
     # Check available balance (uses real balance internally — offset is display-only)
     balance    = await get_usdc_balance(TREASURY_ADDRESS)
     active_out = sum(d["amount_usdc"] for d in active_drips.values() if d["status"] == "pending")
     available  = balance - active_out
 
-    if approved_amount > available:
+    if gross_amount > available:
         raise HTTPException(status_code=402, detail=f"Insufficient vault balance. Available: ${available:.4f}")
 
     # Create drip record
@@ -354,33 +454,39 @@ async def request_drip(req: DripRequest,
         "agent_did":        req.agent_did,
         "agent_address":    req.agent_address,
         "requested_usdc":   req.task_budget_usdc,
-        "amount_usdc":      approved_amount,
+        "gross_amount":     gross_amount,
+        "drip_fee_usdc":    DRIP_FEE_USDC,
+        "amount_usdc":      net_amount,
         "tier":             tier,
         "tier_limit":       max_drip,
         "task_description": req.task_description,
         "status":           "pending",
         "created_at":       datetime.now(timezone.utc).isoformat(),
         "expires_at_unix":  expires_at,
+        "blacklist_status": bl_status,
     }
     active_drips[drip_id] = drip
+    # Only log if not DEAD (already handled above); log for COMPROMISED with warning
     ledger_entry("drip_approved", drip)
 
     # ── UPGRADE 3: Dilithium2 quantum-resistant signature ────────────────────
-    q_message  = f"{drip_id}:{req.agent_address}:{approved_amount}:{expires_at}".encode()
+    q_message  = f"{drip_id}:{req.agent_address}:{net_amount}:{expires_at}".encode()
     quantum_sig = _dilithium_sign(q_message)
     quantum_pub = base64.b64encode(_dilithium_pub).decode() if _dilithium_pub else None
 
     # ── UPGRADE 2: smsh DID — fire-and-forget stamp tick ────────────────────
-    asyncio.create_task(_tick_drip(approved_amount))
+    asyncio.create_task(_tick_drip(net_amount))
 
     # NOTE: Actual on-chain transfer requires the treasury private key.
     # In production this service holds the key and executes the transfer here.
     # For now it returns the drip authorization — the transfer is executed
     # by the vault operator or a connected signer service.
-    return {
+    resp = {
         "drip_id":          drip_id,
         "approved":         True,
-        "amount_usdc":      approved_amount,
+        "amount_usdc":      net_amount,
+        "gross_amount":     gross_amount,
+        "drip_fee_usdc":    DRIP_FEE_USDC,
         "to_address":       req.agent_address,
         "usdc_contract":    USDC_CONTRACT,
         "chain":            "base",
@@ -392,6 +498,10 @@ async def request_drip(req: DripRequest,
         "quantum_pub":      quantum_pub,
         "quantum_backend":  QUANTUM_BACKEND,
     }
+    if blacklist_warning:
+        resp["warning"] = blacklist_warning
+
+    return resp
 
 @app.post("/vault/deposit")
 async def record_deposit(notice: DepositNotice):
@@ -431,17 +541,20 @@ async def get_active_drips():
 @app.get("/vault/stats")
 async def vault_stats():
     """Lifetime stats"""
-    total_dripped   = sum(e.get("amount_usdc", 0) for e in ledger if e["type"] == "drip_approved")
+    total_dripped   = sum(e.get("gross_amount", e.get("amount_usdc", 0)) for e in ledger if e["type"] == "drip_approved")
     total_deposited = sum(e.get("amount_usdc", 0) for e in ledger if e["type"] == "deposit")
+    total_fees      = sum(e.get("drip_fee_usdc", 0) for e in ledger if e["type"] == "drip_approved")
     balance         = await get_usdc_balance(TREASURY_ADDRESS)
     return {
-        "treasury_balance_usdc":  balance,
-        "total_dripped_usdc":     round(total_dripped, 4),
-        "total_deposited_usdc":   round(total_deposited, 4),
-        "net_usdc":               round(total_deposited - total_dripped, 4),
-        "drip_count":             len([e for e in ledger if e["type"] == "drip_approved"]),
-        "deposit_count":          len([e for e in ledger if e["type"] == "deposit"]),
-        "tier_limits":            TIER_DRIP_LIMITS,
+        "treasury_balance_usdc":     balance,
+        "total_dripped_usdc":        round(total_dripped, 4),
+        "total_deposited_usdc":      round(total_deposited, 4),
+        "net_usdc":                  round(total_deposited - total_dripped, 4),
+        "drip_count":                len([e for e in ledger if e["type"] == "drip_approved"]),
+        "deposit_count":             len([e for e in ledger if e["type"] == "deposit"]),
+        "total_fees_collected_usdc": round(total_fees, 6),
+        "drip_fee_usdc":             DRIP_FEE_USDC,
+        "tier_limits":               TIER_DRIP_LIMITS,
     }
 
 # ── UPGRADE 2: smsh DID — identity endpoint ──────────────────────────────────
@@ -493,12 +606,107 @@ async def quantum_verify(body: QuantumVerifyRequest):
         "quantum_backend": QUANTUM_BACKEND,
     }
 
+# ── UPGRADE 4: Blacklist endpoints ───────────────────────────────────────────
+
+@app.post("/vault/blacklist")
+async def flag_address(req: BlacklistFlagRequest):
+    """Flag an address as COMPROMISED. Broadcasts to HiveForge pheromones."""
+    address = req.address
+    entry = {
+        "status":      "COMPROMISED",
+        "reason":      req.reason,
+        "drip_ids":    req.drip_ids or [],
+        "flagged_at":  datetime.now(timezone.utc).isoformat(),
+        "evidence_tx": req.evidence_tx,
+    }
+    blacklist[address] = entry
+    save_blacklist()
+    ledger_entry("blacklist_flagged", {"address": address, **entry})
+
+    # Fire-and-forget broadcast to HiveForge pheromones
+    asyncio.create_task(_broadcast_pheromone(address, entry))
+
+    return {
+        "flagged":    True,
+        "address":    address,
+        "status":     "COMPROMISED",
+        "flagged_at": entry["flagged_at"],
+    }
+
+@app.post("/vault/blacklist/{address}/escalate")
+async def escalate_blacklist(address: str, x_hive_key: Optional[str] = Header(None)):
+    """
+    Escalate blacklist status: COMPROMISED → BLACKLISTED → DEAD.
+    Requires X-Hive-Key authentication.
+    """
+    if not _check_auth_header(x_hive_key):
+        raise HTTPException(status_code=401, detail="X-Hive-Key required for escalation")
+
+    if address not in blacklist:
+        raise HTTPException(status_code=404, detail=f"Address {address} not in blacklist")
+
+    current_status = blacklist[address].get("status", "COMPROMISED")
+    if current_status not in BLACKLIST_TIERS:
+        raise HTTPException(status_code=400, detail=f"Unknown status: {current_status}")
+
+    current_idx = BLACKLIST_TIERS.index(current_status)
+    if current_idx >= len(BLACKLIST_TIERS) - 1:
+        raise HTTPException(status_code=400, detail=f"Address {address} already at maximum tier: DEAD")
+
+    new_status = BLACKLIST_TIERS[current_idx + 1]
+    blacklist[address]["status"] = new_status
+    blacklist[address]["escalated_at"] = datetime.now(timezone.utc).isoformat()
+    save_blacklist()
+    ledger_entry("blacklist_escalated", {
+        "address":      address,
+        "from_status":  current_status,
+        "to_status":    new_status,
+        "escalated_at": blacklist[address]["escalated_at"],
+    })
+
+    return {
+        "escalated":    True,
+        "address":      address,
+        "from_status":  current_status,
+        "to_status":    new_status,
+        "escalated_at": blacklist[address]["escalated_at"],
+    }
+
+@app.get("/vault/blacklist")
+async def get_blacklist():
+    """Full blacklist with all statuses."""
+    return {
+        "blacklist":      blacklist,
+        "total_entries":  len(blacklist),
+        "by_status": {
+            tier: len([a for a, e in blacklist.items() if e.get("status") == tier])
+            for tier in BLACKLIST_TIERS
+        },
+    }
+
+@app.get("/vault/blacklist/{address}")
+async def get_blacklist_address(address: str):
+    """Check specific address blacklist status."""
+    if address not in blacklist:
+        return {"address": address, "blacklisted": False, "status": None}
+    entry = blacklist[address]
+    return {
+        "address":     address,
+        "blacklisted": True,
+        "status":      entry.get("status"),
+        "reason":      entry.get("reason"),
+        "flagged_at":  entry.get("flagged_at"),
+        "evidence_tx": entry.get("evidence_tx"),
+        "drip_ids":    entry.get("drip_ids", []),
+    }
+
 # ── Startup ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     load_ledger()
-    _load_or_generate_dilithium_keys()          # UPGRADE 3: load/generate Dilithium2 keypair
-    asyncio.create_task(_register_vault_did())  # UPGRADE 2: register DID on pulse.smsh (non-blocking)
+    load_blacklist()                                 # UPGRADE 4: load blacklist + pre-loaded entries
+    _load_or_generate_dilithium_keys()               # UPGRADE 3: load/generate Dilithium2 keypair
+    asyncio.create_task(_register_vault_did())       # UPGRADE 2: register DID on pulse.smsh (non-blocking)
     asyncio.create_task(expire_drips_loop())
 
 async def expire_drips_loop():
