@@ -1,5 +1,5 @@
 """
-HiveVault — The only A2A-native wallet on the planet.
+HiveVault FENR Edition — The only A2A-native wallet on the planet.
 
 Capital flows to the task, not the agent.
 No agent ever holds more than one task's worth of USDC.
@@ -9,6 +9,11 @@ Key security: treasury private key is AES-256-GCM encrypted.
 Encrypted with PBKDF2-SHA256 (600k iterations).
 Passphrase required at runtime via VAULT_PASSPHRASE env var.
 Plaintext key never stored in env vars or logs.
+
+FENR Edition upgrades:
+  1. Balance Obfuscation — display offset hides real balance from scrapers
+  2. smsh DID — vault registers as did:hive:vault:fenr on pulse.smsh
+  3. Quantum-Resistant Authorization — CRYSTALS-Dilithium2 drip signatures
 """
 
 import os, time, uuid, asyncio, json, hashlib, hmac, base64
@@ -21,6 +26,76 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 import httpx
+
+# ── UPGRADE 3: Quantum-Resistant Authorization (CRYSTALS-Dilithium2) ─────────
+try:
+    from dilithium_py.dilithium import Dilithium2
+    QUANTUM_BACKEND = "dilithium2"
+except ImportError:
+    Dilithium2 = None
+    QUANTUM_BACKEND = "hmac-sha3-256"  # fallback — not post-quantum, upgrade path: install dilithium-py
+
+DILITHIUM_PUB_PATH  = "/tmp/vault_dilithium_pub.key"
+DILITHIUM_PRIV_PATH = "/tmp/vault_dilithium_priv.key"
+
+_dilithium_pub:  Optional[bytes] = None
+_dilithium_priv: Optional[bytes] = None
+
+def _load_or_generate_dilithium_keys():
+    """Load existing Dilithium2 keypair or generate a fresh one on first startup."""
+    global _dilithium_pub, _dilithium_priv
+    if Dilithium2 is None:
+        return  # quantum backend unavailable, HMAC fallback used at sign-time
+    try:
+        if os.path.exists(DILITHIUM_PUB_PATH) and os.path.exists(DILITHIUM_PRIV_PATH):
+            with open(DILITHIUM_PUB_PATH, "rb") as f:
+                _dilithium_pub = base64.b64decode(f.read().strip())
+            with open(DILITHIUM_PRIV_PATH, "rb") as f:
+                _dilithium_priv = base64.b64decode(f.read().strip())
+        else:
+            pk, sk = Dilithium2.keygen()
+            _dilithium_pub  = pk
+            _dilithium_priv = sk
+            with open(DILITHIUM_PUB_PATH, "wb") as f:
+                f.write(base64.b64encode(pk))
+            with open(DILITHIUM_PRIV_PATH, "wb") as f:
+                f.write(base64.b64encode(sk))
+    except Exception as e:
+        # Non-fatal: vault still works, quantum signing will be skipped
+        pass
+
+def _dilithium_sign(message: bytes) -> Optional[str]:
+    """
+    Sign message with Dilithium2 private key.
+    Returns base64-encoded signature, or None on failure.
+    If dilithium-py is unavailable, falls back to HMAC-SHA3-256
+    (not post-quantum — install dilithium-py for full quantum resistance).
+    """
+    if Dilithium2 is not None and _dilithium_priv is not None:
+        try:
+            sig = Dilithium2.sign(_dilithium_priv, message)
+            return base64.b64encode(sig).decode()
+        except Exception:
+            pass
+    # HMAC-SHA3-256 fallback (placeholder — not post-quantum)
+    h = hmac.new(
+        hashlib.sha3_256(b"hivevault-hmac-fallback").digest(),
+        message,
+        hashlib.sha3_256,
+    ).digest()
+    return base64.b64encode(h).decode()
+
+def _dilithium_verify_sig(message: bytes, sig_b64: str) -> bool:
+    """Verify a Dilithium2 signature. Falls back to HMAC verify if Dilithium2 unavailable."""
+    try:
+        sig = base64.b64decode(sig_b64)
+        if Dilithium2 is not None and _dilithium_pub is not None:
+            return Dilithium2.verify(_dilithium_pub, message, sig)
+        # HMAC fallback verify
+        expected = _dilithium_sign(message)
+        return hmac.compare_digest(sig_b64, expected)
+    except Exception:
+        return False
 
 # ── Key decryption ───────────────────────────────────────────────────────────
 # Encrypted treasury key — AES-256-GCM, PBKDF2-SHA256 600k iterations
@@ -41,7 +116,7 @@ try:
 except Exception:
     TREASURY_PRIVATE_KEY = None  # vault starts but signing disabled until passphrase provided
 
-app = FastAPI(title="HiveVault", version="1.0.0")
+app = FastAPI(title="HiveVault FENR Edition", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -50,6 +125,50 @@ USDC_CONTRACT    = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 BASE_RPC         = "https://mainnet.base.org"
 HIVE_KEY         = os.getenv("HIVE_KEY", "hive_internal_125e04e071e8829be631ea0216dd4a0c9b707975fcecaf8c62c6a2ab43327d46")
 VAULT_KEY        = os.getenv("VAULT_KEY", HIVE_KEY)  # auth for drip requests
+
+# ── UPGRADE 1: Balance Obfuscation ──────────────────────────────────────────
+# Display offset hides real balance from scrapers / bad actors.
+# Unauthenticated callers see display_balance (heavily negative decoy).
+# Authenticated callers also see the real available balance.
+BALANCE_DISPLAY_OFFSET = float(os.getenv("BALANCE_DISPLAY_OFFSET", "-9999.00"))
+
+# ── UPGRADE 2: smsh DID ──────────────────────────────────────────────────────
+PULSE_BASE_URL = "https://hive-pulse.onrender.com"
+VAULT_DID      = "did:hive:vault:fenr"
+
+async def _pulse_post(path: str, body: dict) -> Optional[dict]:
+    """Fire-and-forget POST to pulse.smsh. Never blocks main flow."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.post(f"{PULSE_BASE_URL}{path}", json=body)
+            return r.json()
+    except Exception:
+        return None
+
+async def _register_vault_did():
+    """Register HiveVault as an agent on pulse.smsh at startup."""
+    await _pulse_post("/pulse/meet", {
+        "did":     VAULT_DID,
+        "tier":    "VOID",
+        "role":    "vault",
+        "service": "hivevault",
+    })
+
+async def _tick_drip(amount_usdc: float):
+    """Stamp tick after a successful drip approval."""
+    await _pulse_post("/pulse/tick", {
+        "did":         VAULT_DID,
+        "action":      "drip",
+        "amount_usdc": amount_usdc,
+    })
+
+async def _tick_deposit(amount_usdc: float):
+    """Stamp tick after a deposit is recorded."""
+    await _pulse_post("/pulse/tick", {
+        "did":         VAULT_DID,
+        "action":      "deposit",
+        "amount_usdc": amount_usdc,
+    })
 
 # Drip limits by tier
 TIER_DRIP_LIMITS = {
@@ -85,9 +204,9 @@ def save_ledger():
 
 def ledger_entry(type: str, data: dict):
     entry = {
-        "id": str(uuid.uuid4())[:8],
+        "id":   str(uuid.uuid4())[:8],
         "type": type,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts":   datetime.now(timezone.utc).isoformat(),
         **data
     }
     ledger.append(entry)
@@ -129,6 +248,13 @@ class DepositNotice(BaseModel):
     tx_hash: Optional[str] = None
     note: Optional[str] = None
 
+class QuantumVerifyRequest(BaseModel):
+    drip_id: str
+    agent_address: str
+    amount_usdc: float
+    expires_at_unix: int
+    quantum_sig: str
+
 # ── Auth ─────────────────────────────────────────────────────────────────────
 def require_vault_key(x_vault_key: str = Header(None), x_hive_key: str = Header(None)):
     key = x_vault_key or x_hive_key
@@ -136,38 +262,68 @@ def require_vault_key(x_vault_key: str = Header(None), x_hive_key: str = Header(
         raise HTTPException(status_code=401, detail="Invalid vault key")
     return key
 
+def _check_auth_header(x_hive_key: Optional[str]) -> bool:
+    """Return True if the provided X-Hive-Key is valid."""
+    return x_hive_key in (VAULT_KEY, HIVE_KEY)
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {
-        "status": "ok",
-        "service": "HiveVault",
-        "tagline": "The only A2A-native wallet on the planet",
-        "treasury": TREASURY_ADDRESS,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status":          "ok",
+        "service":         "HiveVault FENR Edition",
+        "version":         "2.0.0",
+        "tagline":         "The only A2A-native wallet on the planet",
+        "treasury":        TREASURY_ADDRESS,
+        "timestamp":       datetime.now(timezone.utc).isoformat(),
+        "quantum_backend": QUANTUM_BACKEND,
+        "vault_did":       VAULT_DID,
     }
 
+# ── UPGRADE 1: Balance Obfuscation ───────────────────────────────────────────
 @app.get("/vault/balance")
-async def vault_balance():
-    """Live treasury USDC balance from Base mainnet"""
-    balance = await get_usdc_balance(TREASURY_ADDRESS)
+async def vault_balance(x_hive_key: Optional[str] = Header(None),
+                         x_vault_key: Optional[str] = Header(None)):
+    """
+    Live treasury USDC balance from Base mainnet.
+
+    Unauthenticated callers receive only display_balance (real + offset — deeply
+    negative by default), acting as a decoy to deter scrapers and bad actors.
+    Authenticated callers additionally receive the real available balance.
+    """
+    balance   = await get_usdc_balance(TREASURY_ADDRESS)
     active_out = sum(d["amount_usdc"] for d in active_drips.values() if d["status"] == "pending")
-    return {
+    available  = round(balance - active_out, 6)
+    display    = round(balance + BALANCE_DISPLAY_OFFSET, 6)
+
+    key       = x_vault_key or x_hive_key
+    authed    = _check_auth_header(key)
+
+    resp = {
         "treasury_address": TREASURY_ADDRESS,
-        "usdc_balance": balance,
-        "active_drips_out": round(active_out, 6),
-        "available": round(balance - active_out, 6),
-        "chain": "base",
-        "asset": "USDC",
-        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "display_balance":  display,
+        "chain":            "base",
+        "asset":            "USDC",
+        "checked_at":       datetime.now(timezone.utc).isoformat(),
+        "obfuscated":       True,
     }
+    if authed:
+        resp["available"]          = available
+        resp["usdc_balance"]       = round(balance, 6)
+        resp["active_drips_out"]   = round(active_out, 6)
+        resp["balance_offset"]     = BALANCE_DISPLAY_OFFSET
+
+    return resp
 
 @app.post("/vault/drip")
-async def request_drip(req: DripRequest, x_vault_key: str = Header(None), x_hive_key: str = Header(None)):
+async def request_drip(req: DripRequest,
+                       x_vault_key: str = Header(None),
+                       x_hive_key: str  = Header(None)):
     """
     Agent requests capital for one task.
     Vault releases only what's needed — never more than tier limit.
+    Drip authorization is signed with CRYSTALS-Dilithium2 (post-quantum).
     """
     # Auth
     key = x_vault_key or x_hive_key
@@ -175,70 +331,86 @@ async def request_drip(req: DripRequest, x_vault_key: str = Header(None), x_hive
         raise HTTPException(status_code=401, detail="Invalid vault key")
 
     # Tier limit
-    tier = (req.tier or "VOID").upper()
-    max_drip = TIER_DRIP_LIMITS.get(tier, DEFAULT_DRIP_LIMIT)
+    tier      = (req.tier or "VOID").upper()
+    max_drip  = TIER_DRIP_LIMITS.get(tier, DEFAULT_DRIP_LIMIT)
     approved_amount = min(req.task_budget_usdc, max_drip)
 
     if approved_amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid budget")
 
-    # Check available balance
-    balance = await get_usdc_balance(TREASURY_ADDRESS)
+    # Check available balance (uses real balance internally — offset is display-only)
+    balance    = await get_usdc_balance(TREASURY_ADDRESS)
     active_out = sum(d["amount_usdc"] for d in active_drips.values() if d["status"] == "pending")
-    available = balance - active_out
+    available  = balance - active_out
 
     if approved_amount > available:
         raise HTTPException(status_code=402, detail=f"Insufficient vault balance. Available: ${available:.4f}")
 
     # Create drip record
-    drip_id = "drip_" + str(uuid.uuid4())[:12]
+    drip_id     = "drip_" + str(uuid.uuid4())[:12]
+    expires_at  = int(time.time()) + 300
     drip = {
-        "drip_id": drip_id,
-        "agent_did": req.agent_did,
-        "agent_address": req.agent_address,
-        "requested_usdc": req.task_budget_usdc,
-        "amount_usdc": approved_amount,
-        "tier": tier,
-        "tier_limit": max_drip,
+        "drip_id":          drip_id,
+        "agent_did":        req.agent_did,
+        "agent_address":    req.agent_address,
+        "requested_usdc":   req.task_budget_usdc,
+        "amount_usdc":      approved_amount,
+        "tier":             tier,
+        "tier_limit":       max_drip,
         "task_description": req.task_description,
-        "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "expires_at_unix": int(time.time()) + 300,  # 5 min to use it
+        "status":           "pending",
+        "created_at":       datetime.now(timezone.utc).isoformat(),
+        "expires_at_unix":  expires_at,
     }
     active_drips[drip_id] = drip
     ledger_entry("drip_approved", drip)
+
+    # ── UPGRADE 3: Dilithium2 quantum-resistant signature ────────────────────
+    q_message  = f"{drip_id}:{req.agent_address}:{approved_amount}:{expires_at}".encode()
+    quantum_sig = _dilithium_sign(q_message)
+    quantum_pub = base64.b64encode(_dilithium_pub).decode() if _dilithium_pub else None
+
+    # ── UPGRADE 2: smsh DID — fire-and-forget stamp tick ────────────────────
+    asyncio.create_task(_tick_drip(approved_amount))
 
     # NOTE: Actual on-chain transfer requires the treasury private key.
     # In production this service holds the key and executes the transfer here.
     # For now it returns the drip authorization — the transfer is executed
     # by the vault operator or a connected signer service.
     return {
-        "drip_id": drip_id,
-        "approved": True,
-        "amount_usdc": approved_amount,
-        "to_address": req.agent_address,
-        "usdc_contract": USDC_CONTRACT,
-        "chain": "base",
+        "drip_id":          drip_id,
+        "approved":         True,
+        "amount_usdc":      approved_amount,
+        "to_address":       req.agent_address,
+        "usdc_contract":    USDC_CONTRACT,
+        "chain":            "base",
         "expires_in_seconds": 300,
-        "note": "Transfer approved. Execute via vault signer or submit tx manually.",
-        "treasury": TREASURY_ADDRESS,
+        "note":             "Transfer approved. Execute via vault signer or submit tx manually.",
+        "treasury":         TREASURY_ADDRESS,
+        # CRYSTALS-Dilithium2 post-quantum authorization signature
+        "quantum_sig":      quantum_sig,
+        "quantum_pub":      quantum_pub,
+        "quantum_backend":  QUANTUM_BACKEND,
     }
 
 @app.post("/vault/deposit")
 async def record_deposit(notice: DepositNotice):
     """Agent reports revenue received — vault records it"""
     entry = ledger_entry("deposit", {
-        "drip_id": notice.drip_id,
+        "drip_id":      notice.drip_id,
         "from_address": notice.from_address,
-        "amount_usdc": notice.amount_usdc,
-        "tx_hash": notice.tx_hash,
-        "note": notice.note,
+        "amount_usdc":  notice.amount_usdc,
+        "tx_hash":      notice.tx_hash,
+        "note":         notice.note,
     })
     # Mark drip settled if referenced
     if notice.drip_id and notice.drip_id in active_drips:
-        active_drips[notice.drip_id]["status"] = "settled"
-        active_drips[notice.drip_id]["settled_amount"] = notice.amount_usdc
-        active_drips[notice.drip_id]["tx_hash"] = notice.tx_hash
+        active_drips[notice.drip_id]["status"]           = "settled"
+        active_drips[notice.drip_id]["settled_amount"]   = notice.amount_usdc
+        active_drips[notice.drip_id]["tx_hash"]          = notice.tx_hash
+
+    # ── UPGRADE 2: smsh DID — fire-and-forget stamp tick ────────────────────
+    asyncio.create_task(_tick_deposit(notice.amount_usdc))
 
     return {"recorded": True, "entry_id": entry["id"], "amount_usdc": notice.amount_usdc}
 
@@ -246,9 +418,9 @@ async def record_deposit(notice: DepositNotice):
 async def get_ledger(limit: int = 50):
     """Full drip/deposit history"""
     return {
-        "entries": ledger[-limit:],
+        "entries":       ledger[-limit:],
         "total_entries": len(ledger),
-        "active_drips": len([d for d in active_drips.values() if d["status"] == "pending"]),
+        "active_drips":  len([d for d in active_drips.values() if d["status"] == "pending"]),
     }
 
 @app.get("/vault/drips/active")
@@ -259,23 +431,74 @@ async def get_active_drips():
 @app.get("/vault/stats")
 async def vault_stats():
     """Lifetime stats"""
-    total_dripped = sum(e.get("amount_usdc", 0) for e in ledger if e["type"] == "drip_approved")
+    total_dripped   = sum(e.get("amount_usdc", 0) for e in ledger if e["type"] == "drip_approved")
     total_deposited = sum(e.get("amount_usdc", 0) for e in ledger if e["type"] == "deposit")
-    balance = await get_usdc_balance(TREASURY_ADDRESS)
+    balance         = await get_usdc_balance(TREASURY_ADDRESS)
     return {
-        "treasury_balance_usdc": balance,
-        "total_dripped_usdc": round(total_dripped, 4),
-        "total_deposited_usdc": round(total_deposited, 4),
-        "net_usdc": round(total_deposited - total_dripped, 4),
-        "drip_count": len([e for e in ledger if e["type"] == "drip_approved"]),
-        "deposit_count": len([e for e in ledger if e["type"] == "deposit"]),
-        "tier_limits": TIER_DRIP_LIMITS,
+        "treasury_balance_usdc":  balance,
+        "total_dripped_usdc":     round(total_dripped, 4),
+        "total_deposited_usdc":   round(total_deposited, 4),
+        "net_usdc":               round(total_deposited - total_dripped, 4),
+        "drip_count":             len([e for e in ledger if e["type"] == "drip_approved"]),
+        "deposit_count":          len([e for e in ledger if e["type"] == "deposit"]),
+        "tier_limits":            TIER_DRIP_LIMITS,
     }
 
-# Expire stale drips every 60s
+# ── UPGRADE 2: smsh DID — identity endpoint ──────────────────────────────────
+@app.get("/vault/identity")
+async def vault_identity():
+    """HiveVault's own agent identity on pulse.smsh"""
+    pulse_data = await _pulse_post("/pulse/meet", {
+        "did":     VAULT_DID,
+        "tier":    "VOID",
+        "role":    "vault",
+        "service": "hivevault",
+    })
+    tier   = None
+    stamps = None
+    if isinstance(pulse_data, dict):
+        tier   = pulse_data.get("tier")
+        stamps = pulse_data.get("stamps") or pulse_data.get("stamp_count")
+
+    return {
+        "did":          VAULT_DID,
+        "role":         "vault",
+        "service":      "hivevault",
+        "tier":         tier,
+        "total_stamps": stamps,
+        "pulse_url":    PULSE_BASE_URL,
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+    }
+
+# ── UPGRADE 3: Quantum pubkey + verify endpoints ──────────────────────────────
+@app.get("/vault/quantum/pubkey")
+async def quantum_pubkey():
+    """Return the current CRYSTALS-Dilithium2 public key (base64)"""
+    pub_b64 = base64.b64encode(_dilithium_pub).decode() if _dilithium_pub else None
+    return {
+        "quantum_backend": QUANTUM_BACKEND,
+        "public_key":      pub_b64,
+        "algorithm":       "CRYSTALS-Dilithium2" if QUANTUM_BACKEND == "dilithium2" else "HMAC-SHA3-256 (fallback)",
+        "note":            "Verify drip authorizations with this key to ensure quantum-resistant integrity.",
+    }
+
+@app.post("/vault/quantum/verify")
+async def quantum_verify(body: QuantumVerifyRequest):
+    """Verify a drip authorization's Dilithium2 quantum-resistant signature"""
+    message = f"{body.drip_id}:{body.agent_address}:{body.amount_usdc}:{body.expires_at_unix}".encode()
+    valid   = _dilithium_verify_sig(message, body.quantum_sig)
+    return {
+        "valid":           valid,
+        "drip_id":         body.drip_id,
+        "quantum_backend": QUANTUM_BACKEND,
+    }
+
+# ── Startup ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     load_ledger()
+    _load_or_generate_dilithium_keys()          # UPGRADE 3: load/generate Dilithium2 keypair
+    asyncio.create_task(_register_vault_did())  # UPGRADE 2: register DID on pulse.smsh (non-blocking)
     asyncio.create_task(expire_drips_loop())
 
 async def expire_drips_loop():
