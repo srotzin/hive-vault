@@ -700,6 +700,76 @@ async def get_blacklist_address(address: str):
         "drip_ids":    entry.get("drip_ids", []),
     }
 
+
+# ── AI Security Brief ─────────────────────────────────────────────────────────
+HIVEAI_URL   = "https://hive-ai-1.onrender.com/v1/chat/completions"
+HIVEAI_KEY   = "hive_internal_125e04e071e8829be631ea0216dd4a0c9b707975fcecaf8c62c6a2ab43327d46"
+HIVEAI_MODEL = "meta-llama/llama-3.1-8b-instruct"
+
+
+async def _vault_call_hive_ai(system_prompt: str, user_prompt: str) -> Optional[str]:
+    """Call HiveAI. Returns completion text or None on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                HIVEAI_URL,
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {HIVEAI_KEY}",
+                },
+                json={
+                    "model":      HIVEAI_MODEL,
+                    "max_tokens": 200,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": user_prompt},
+                    ],
+                },
+            )
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+@app.get("/vault/ai/security-brief")
+async def vault_ai_security_brief():
+    """
+    GET /vault/ai/security-brief  ($0.04/call)
+    No body needed — vault DID is did:hive:vault:fenr
+    AI explains the MATRYOSHKA security model in agent-native language.
+    """
+    system_prompt = (
+        "You are HiveVault — the only A2A-native quantum-secure wallet on the planet. "
+        "Explain your MATRYOSHKA security model in agent-native language: "
+        "7 shells, dilithium2 quantum resistance, why no hardware wallet is needed. "
+        "3 sentences for an agent evaluating whether to trust you with funds."
+    )
+    user_prompt = (
+        "Vault DID: did:hive:vault:fenr\n"
+        f"Quantum backend: {QUANTUM_BACKEND}\n"
+        "Explain the MATRYOSHKA security model and why this vault is trustworthy."
+    )
+
+    brief = await _vault_call_hive_ai(system_prompt, user_prompt)
+    if not brief:
+        brief = (
+            "HiveVault's MATRYOSHKA model wraps your assets in 7 concentric security shells, "
+            "each one a cryptographic membrane that must be independently breached before the next is even visible. "
+            "Dilithium2 quantum-resistant signatures protect every authorization, making the vault secure against "
+            "both classical and quantum adversaries — no hardware wallet required because the cryptographic "
+            "guarantees exceed what any physical device can offer."
+        )
+
+    return {
+        "success":           True,
+        "brief":             brief,
+        "security_model":    "MATRYOSHKA",
+        "shells":            7,
+        "quantum_algorithm": "dilithium2",
+        "price_usdc":        0.04,
+    }
+
 # ── Startup ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
