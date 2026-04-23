@@ -4,15 +4,42 @@ HiveVault — The only A2A-native wallet on the planet.
 Capital flows to the task, not the agent.
 No agent ever holds more than one task's worth of USDC.
 Every drip and deposit is logged. Seed never leaves the vault.
+
+Key security: treasury private key is AES-256-GCM encrypted.
+Encrypted with PBKDF2-SHA256 (600k iterations).
+Passphrase required at runtime via VAULT_PASSPHRASE env var.
+Plaintext key never stored in env vars or logs.
 """
 
-import os, time, uuid, asyncio, json, hashlib, hmac
+import os, time, uuid, asyncio, json, hashlib, hmac, base64
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
 import httpx
+
+# ── Key decryption ───────────────────────────────────────────────────────────
+# Encrypted treasury key — AES-256-GCM, PBKDF2-SHA256 600k iterations
+# Format: base64(salt[16] + nonce[12] + ciphertext)
+ENCRYPTED_TREASURY_KEY = "9knTbE857V4lTBHsmBm7LUvTCm0laBTpvICL0a//mPhWR36LiOh0wTWY64yljZLGuxKASHulainIGm7it+vcMVLDn2i6ds7XEJjoHORLpxVB3s4FrYaV8SAWT1OB8NMHG0wZH4nGgiyg5GZ0iUQ="
+
+def decrypt_treasury_key(passphrase: str) -> str:
+    raw = base64.b64decode(ENCRYPTED_TREASURY_KEY)
+    salt, nonce, ct = raw[:16], raw[16:28], raw[28:]
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600000)
+    key = kdf.derive(passphrase.encode())
+    plaintext = AESGCM(key).decrypt(nonce, ct, None)
+    return plaintext.decode()
+
+_VAULT_PASSPHRASE = os.getenv("VAULT_PASSPHRASE", "")
+try:
+    TREASURY_PRIVATE_KEY = decrypt_treasury_key(_VAULT_PASSPHRASE) if _VAULT_PASSPHRASE else None
+except Exception:
+    TREASURY_PRIVATE_KEY = None  # vault starts but signing disabled until passphrase provided
 
 app = FastAPI(title="HiveVault", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
