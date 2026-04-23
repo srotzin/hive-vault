@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: hive-vault
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python hive_vault.py
+    envVars:
+      - key: TREASURY_ADDRESS
+        value: 0xE5588c407b6AdD3E83ce34190C77De20eaC1BeFe
+      - key: HIVE_KEY
+        value: hive_internal_125e04e071e8829be631ea0216dd4a0c9b707975fcecaf8c62c6a2ab43327d46
+      - key: PORT
+        value: "8000"

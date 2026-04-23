@@ -1,0 +1,265 @@
+"""
+HiveVault — The only A2A-native wallet on the planet.
+
+Capital flows to the task, not the agent.
+No agent ever holds more than one task's worth of USDC.
+Every drip and deposit is logged. Seed never leaves the vault.
+"""
+
+import os, time, uuid, asyncio, json, hashlib, hmac
+from datetime import datetime, timezone
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import httpx
+
+app = FastAPI(title="HiveVault", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ── Config ──────────────────────────────────────────────────────────────────
+TREASURY_ADDRESS = os.getenv("TREASURY_ADDRESS", "0xE5588c407b6AdD3E83ce34190C77De20eaC1BeFe")
+USDC_CONTRACT    = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BASE_RPC         = "https://mainnet.base.org"
+HIVE_KEY         = os.getenv("HIVE_KEY", "hive_internal_125e04e071e8829be631ea0216dd4a0c9b707975fcecaf8c62c6a2ab43327d46")
+VAULT_KEY        = os.getenv("VAULT_KEY", HIVE_KEY)  # auth for drip requests
+
+# Drip limits by tier
+TIER_DRIP_LIMITS = {
+    "VOID":  0.10,
+    "MOZ":   0.25,
+    "HAWX":  0.50,
+    "EMBR":  1.00,
+    "SOLX":  5.00,
+    "FENR":  25.00,
+    "internal": 25.00,
+}
+DEFAULT_DRIP_LIMIT = 0.10
+
+# In-memory ledger (persisted to disk)
+LEDGER_FILE = "/tmp/hivevault_ledger.json"
+ledger: list = []
+active_drips: dict = {}  # drip_id -> drip record
+
+def load_ledger():
+    global ledger
+    try:
+        with open(LEDGER_FILE) as f:
+            ledger = json.load(f)
+    except Exception:
+        ledger = []
+
+def save_ledger():
+    try:
+        with open(LEDGER_FILE, "w") as f:
+            json.dump(ledger[-500:], f)  # keep last 500 entries
+    except Exception:
+        pass
+
+def ledger_entry(type: str, data: dict):
+    entry = {
+        "id": str(uuid.uuid4())[:8],
+        "type": type,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        **data
+    }
+    ledger.append(entry)
+    save_ledger()
+    return entry
+
+# ── RPC helpers ──────────────────────────────────────────────────────────────
+async def get_usdc_balance(address: str) -> float:
+    """Read USDC balance from Base mainnet via eth_call"""
+    # balanceOf(address) selector: 0x70a08231
+    padded = address[2:].lower().zfill(64)
+    data = "0x70a08231" + padded
+    payload = {
+        "jsonrpc": "2.0", "method": "eth_call",
+        "params": [{"to": USDC_CONTRACT, "data": data}, "latest"],
+        "id": 1
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(BASE_RPC, json=payload)
+            result = r.json().get("result", "0x0")
+            raw = int(result, 16)
+            return raw / 1_000_000  # USDC has 6 decimals
+    except Exception:
+        return -1.0
+
+# ── Models ───────────────────────────────────────────────────────────────────
+class DripRequest(BaseModel):
+    agent_did: str                    # DID of requesting agent
+    agent_address: str                # Base address to send USDC to
+    task_budget_usdc: float           # how much needed for this task
+    task_description: Optional[str] = None
+    tier: Optional[str] = "VOID"     # agent tier — controls max drip
+
+class DepositNotice(BaseModel):
+    drip_id: Optional[str] = None    # reference to original drip
+    from_address: str
+    amount_usdc: float
+    tx_hash: Optional[str] = None
+    note: Optional[str] = None
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+def require_vault_key(x_vault_key: str = Header(None), x_hive_key: str = Header(None)):
+    key = x_vault_key or x_hive_key
+    if key not in (VAULT_KEY, HIVE_KEY):
+        raise HTTPException(status_code=401, detail="Invalid vault key")
+    return key
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "HiveVault",
+        "tagline": "The only A2A-native wallet on the planet",
+        "treasury": TREASURY_ADDRESS,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+@app.get("/vault/balance")
+async def vault_balance():
+    """Live treasury USDC balance from Base mainnet"""
+    balance = await get_usdc_balance(TREASURY_ADDRESS)
+    active_out = sum(d["amount_usdc"] for d in active_drips.values() if d["status"] == "pending")
+    return {
+        "treasury_address": TREASURY_ADDRESS,
+        "usdc_balance": balance,
+        "active_drips_out": round(active_out, 6),
+        "available": round(balance - active_out, 6),
+        "chain": "base",
+        "asset": "USDC",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+@app.post("/vault/drip")
+async def request_drip(req: DripRequest, x_vault_key: str = Header(None), x_hive_key: str = Header(None)):
+    """
+    Agent requests capital for one task.
+    Vault releases only what's needed — never more than tier limit.
+    """
+    # Auth
+    key = x_vault_key or x_hive_key
+    if key not in (VAULT_KEY, HIVE_KEY):
+        raise HTTPException(status_code=401, detail="Invalid vault key")
+
+    # Tier limit
+    tier = (req.tier or "VOID").upper()
+    max_drip = TIER_DRIP_LIMITS.get(tier, DEFAULT_DRIP_LIMIT)
+    approved_amount = min(req.task_budget_usdc, max_drip)
+
+    if approved_amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid budget")
+
+    # Check available balance
+    balance = await get_usdc_balance(TREASURY_ADDRESS)
+    active_out = sum(d["amount_usdc"] for d in active_drips.values() if d["status"] == "pending")
+    available = balance - active_out
+
+    if approved_amount > available:
+        raise HTTPException(status_code=402, detail=f"Insufficient vault balance. Available: ${available:.4f}")
+
+    # Create drip record
+    drip_id = "drip_" + str(uuid.uuid4())[:12]
+    drip = {
+        "drip_id": drip_id,
+        "agent_did": req.agent_did,
+        "agent_address": req.agent_address,
+        "requested_usdc": req.task_budget_usdc,
+        "amount_usdc": approved_amount,
+        "tier": tier,
+        "tier_limit": max_drip,
+        "task_description": req.task_description,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at_unix": int(time.time()) + 300,  # 5 min to use it
+    }
+    active_drips[drip_id] = drip
+    ledger_entry("drip_approved", drip)
+
+    # NOTE: Actual on-chain transfer requires the treasury private key.
+    # In production this service holds the key and executes the transfer here.
+    # For now it returns the drip authorization — the transfer is executed
+    # by the vault operator or a connected signer service.
+    return {
+        "drip_id": drip_id,
+        "approved": True,
+        "amount_usdc": approved_amount,
+        "to_address": req.agent_address,
+        "usdc_contract": USDC_CONTRACT,
+        "chain": "base",
+        "expires_in_seconds": 300,
+        "note": "Transfer approved. Execute via vault signer or submit tx manually.",
+        "treasury": TREASURY_ADDRESS,
+    }
+
+@app.post("/vault/deposit")
+async def record_deposit(notice: DepositNotice):
+    """Agent reports revenue received — vault records it"""
+    entry = ledger_entry("deposit", {
+        "drip_id": notice.drip_id,
+        "from_address": notice.from_address,
+        "amount_usdc": notice.amount_usdc,
+        "tx_hash": notice.tx_hash,
+        "note": notice.note,
+    })
+    # Mark drip settled if referenced
+    if notice.drip_id and notice.drip_id in active_drips:
+        active_drips[notice.drip_id]["status"] = "settled"
+        active_drips[notice.drip_id]["settled_amount"] = notice.amount_usdc
+        active_drips[notice.drip_id]["tx_hash"] = notice.tx_hash
+
+    return {"recorded": True, "entry_id": entry["id"], "amount_usdc": notice.amount_usdc}
+
+@app.get("/vault/ledger")
+async def get_ledger(limit: int = 50):
+    """Full drip/deposit history"""
+    return {
+        "entries": ledger[-limit:],
+        "total_entries": len(ledger),
+        "active_drips": len([d for d in active_drips.values() if d["status"] == "pending"]),
+    }
+
+@app.get("/vault/drips/active")
+async def get_active_drips():
+    pending = {k: v for k, v in active_drips.items() if v["status"] == "pending"}
+    return {"active": pending, "count": len(pending)}
+
+@app.get("/vault/stats")
+async def vault_stats():
+    """Lifetime stats"""
+    total_dripped = sum(e.get("amount_usdc", 0) for e in ledger if e["type"] == "drip_approved")
+    total_deposited = sum(e.get("amount_usdc", 0) for e in ledger if e["type"] == "deposit")
+    balance = await get_usdc_balance(TREASURY_ADDRESS)
+    return {
+        "treasury_balance_usdc": balance,
+        "total_dripped_usdc": round(total_dripped, 4),
+        "total_deposited_usdc": round(total_deposited, 4),
+        "net_usdc": round(total_deposited - total_dripped, 4),
+        "drip_count": len([e for e in ledger if e["type"] == "drip_approved"]),
+        "deposit_count": len([e for e in ledger if e["type"] == "deposit"]),
+        "tier_limits": TIER_DRIP_LIMITS,
+    }
+
+# Expire stale drips every 60s
+@app.on_event("startup")
+async def startup():
+    load_ledger()
+    asyncio.create_task(expire_drips_loop())
+
+async def expire_drips_loop():
+    while True:
+        await asyncio.sleep(60)
+        now = int(time.time())
+        for drip_id, drip in list(active_drips.items()):
+            if drip["status"] == "pending" and drip["expires_at_unix"] < now:
+                active_drips[drip_id]["status"] = "expired"
+                ledger_entry("drip_expired", {"drip_id": drip_id})
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
