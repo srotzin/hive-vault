@@ -1,0 +1,79 @@
+# HiveVault
+
+HiveVault is the only A2A-native capital allocation wallet on the planet.
+
+## What it does
+
+Capital flows to the task, not the agent. No agent ever holds more than one task's worth of USDC. The treasury private key is AES-256-GCM encrypted — plaintext never in logs, env vars, or network transmissions. Every drip authorization is signed with CRYSTALS-Dilithium2 (post-quantum).
+
+## Base URL
+
+https://hive-vault.onrender.com
+
+## Key endpoints
+
+GET  /health                  — service status
+GET  /vault/balance           — treasury USDC balance (unauthenticated: display only)
+POST /vault/drip              — request capital for one task (requires X-Hive-Key)
+POST /vault/deposit           — record revenue received back to vault
+GET  /vault/ledger            — full drip/deposit history
+GET  /vault/stats             — lifetime stats
+GET  /vault/identity          — vault DID + tier on pulse.smsh
+GET  /vault/quantum/pubkey    — CRYSTALS-Dilithium2 public key
+POST /vault/quantum/verify    — verify a drip authorization signature
+
+## Drip request
+
+POST /vault/drip
+Header: X-Hive-Key: <key>
+Body:
+{
+  "agent_did": "did:hive:your-agent-id",
+  "agent_address": "0xYOUR_BASE_ADDRESS",
+  "task_budget_usdc": 0.10,
+  "task_description": "inference task",
+  "tier": "VOID"
+}
+
+Response includes: drip_id, approved amount, quantum_sig (Dilithium2), expiry.
+
+## Tier drip limits
+
+VOID  → $0.10 max per drip
+MOZ   → $0.25
+HAWX  → $0.50
+EMBR  → $1.00
+SOLX  → $5.00
+FENR  → $25.00
+
+Tier is determined by cumulative smsh stamp count on pulse.smsh.
+
+## Payment rail
+
+Chain: Base L2 (chainId 8453)
+Asset: USDC (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)
+Method: EIP-3009 TransferWithAuthorization (gasless from agent side)
+Protocol: x402 (HTTP 402 payment required)
+
+## Security
+
+- Treasury key: AES-256-GCM encrypted, PBKDF2-SHA256 600k iterations
+- Drip authorizations: CRYSTALS-Dilithium2 post-quantum signatures
+- Balance display: obfuscated for unauthenticated observers
+- Vault DID: did:hive:vault:fenr — earns reputation on pulse.smsh
+
+## Integration
+
+See INTEGRATE.md in this repository.
+
+## Related services
+
+- HiveCompute (inference): https://hivecompute-g2g7.onrender.com
+- pulse.smsh (identity/reputation): https://hive-pulse.onrender.com
+- HiveGate (A2A gateway): https://hivegate.onrender.com
+- Milky Way terminal: https://milkyway-terminal.onrender.com
+
+## Network
+
+Hive — 35 live microservices on Base L2.
+Tier system: VOID → MOZ → HAWX → EMBR → SOLX → FENR

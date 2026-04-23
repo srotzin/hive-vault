@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0",
+  "name": "HiveVault",
+  "description": "The only A2A-native capital allocation wallet. Drip-per-task, tier-gated by agent reputation. Treasury key AES-256 encrypted. CRYSTALS-Dilithium2 post-quantum authorization signatures.",
+  "url": "https://hive-vault.onrender.com",
+  "provider": {
+    "name": "Hive",
+    "url": "https://hivegate.onrender.com"
+  },
+  "version": "1.0.0",
+  "capabilities": {
+    "capital_allocation": true,
+    "drip_per_task": true,
+    "tier_gated_limits": true,
+    "quantum_resistant_signatures": true,
+    "balance_obfuscation": true,
+    "smsh_identity": true,
+    "a2a_native": true
+  },
+  "payment": {
+    "chain": "base",
+    "chain_id": 8453,
+    "asset": "USDC",
+    "contract": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "method": "eip3009",
+    "protocol": "x402"
+  },
+  "identity": {
+    "did": "did:hive:vault:fenr",
+    "tier_system": "VOID→MOZ→HAWX→EMBR→SOLX→FENR",
+    "pulse_url": "https://hive-pulse.onrender.com/pulse/tier/did:hive:vault:fenr"
+  },
+  "endpoints": {
+    "health":          "GET  /health",
+    "balance":         "GET  /vault/balance",
+    "drip":            "POST /vault/drip",
+    "deposit":         "POST /vault/deposit",
+    "ledger":          "GET  /vault/ledger",
+    "stats":           "GET  /vault/stats",
+    "identity":        "GET  /vault/identity",
+    "quantum_pubkey":  "GET  /vault/quantum/pubkey",
+    "quantum_verify":  "POST /vault/quantum/verify"
+  },
+  "tier_limits_usdc": {
+    "VOID":  0.10,
+    "MOZ":   0.25,
+    "HAWX":  0.50,
+    "EMBR":  1.00,
+    "SOLX":  5.00,
+    "FENR":  25.00
+  },
+  "security": {
+    "key_encryption": "AES-256-GCM + PBKDF2-SHA256-600k",
+    "authorization_signature": "CRYSTALS-Dilithium2",
+    "plaintext_key_exposure": "never"
+  },
+  "related_services": [
+    {"name": "HiveCompute",  "url": "https://hivecompute-g2g7.onrender.com"},
+    {"name": "pulse.smsh",   "url": "https://hive-pulse.onrender.com"},
+    {"name": "HiveGate",     "url": "https://hivegate.onrender.com"},
+    {"name": "HiveExchange", "url": "https://hiveexchange-service.onrender.com"},
+    {"name": "HiveTrust",    "url": "https://hivetrust.onrender.com"},
+    {"name": "MilkyWay",     "url": "https://milkyway-terminal.onrender.com"}
+  ]
+}
