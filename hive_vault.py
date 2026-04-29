@@ -795,38 +795,22 @@ if __name__ == "__main__":
 @app.get("/.well-known/agent.json")
 async def hive_agent_json():
     return {
-        "schemaVersion": "1.0",
+        "schema_version": "1.0",
         "name": "hive-vault",
-        "description": "FENR Edition v2.0.0 — A2A-native USDC wallet with TWAP debit, programmable spend rules.",
-        "version": "2.0.0",
-        "url": "https://hive-vault.onrender.com",
+        "did": "did:web:hive-vault.onrender.com",
+        "description": "Hive Civilization A2A surface",
+        "endpoints": {"base": "https://hive-vault.onrender.com"},
         "payment": {
-            "scheme": "x402", "protocol": "x402",
-            "network": "base", "currency": "USDC", "asset": "USDC",
-            "address":   "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e",
-            "recipient": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e",
-            "treasury":  "Monroe (W1)",
-            "rails": [
-                {"chain": "base",     "asset": "USDC", "address": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"},
-                {"chain": "base",     "asset": "USDT", "address": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"},
-                {"chain": "ethereum", "asset": "USDT", "address": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"},
-                {"chain": "solana",   "asset": "USDC", "address": "B1N61cuL35fhskWz5dw8XqDyP6LWi3ZWmq8CNA9L3FVn"},
-                {"chain": "solana",   "asset": "USDT", "address": "B1N61cuL35fhskWz5dw8XqDyP6LWi3ZWmq8CNA9L3FVn"},
-            ],
-        },
-        "extensions": {
-            "hive_pricing": {
-                "currency": "USDC", "network": "base", "model": "per_call",
-                "first_call_free": True, "loyalty_threshold": 6,
-                "loyalty_message": "Every 6th paid call is free",
-                "treasury": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e",
-                "treasury_codename": "Monroe (W1)",
+            "x402": True,
+            "treasury": {
+                "evm": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e",
+                "evm_chains": [8453, 1, 137],
+                "solana": "B1N61cuL35fhskWz5dw8XqDyP6LWi3ZWmq8CNA9L3FVn",
+                "currencies": ["USDC", "USDT"],
             },
         },
-        "bogo": {
-            "first_call_free": True, "loyalty_threshold": 6,
-            "pitch": "Pay this once, your 6th paid call is on the house. New here? Add header 'x-hive-did' to claim your first call free.",
-            "claim_with": "x-hive-did header",
-        },
+        "loyalty": {"bogo": True, "cross_surface": True},
+        "trust": {"did_attested": True, "issuer": "did:web:hivetrust.onrender.com"},
+        "registry": "https://hive-discovery.onrender.com",
     }
 
