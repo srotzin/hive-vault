@@ -788,10 +788,6 @@ async def expire_drips_loop():
                 active_drips[drip_id]["status"] = "expired"
                 ledger_entry("drip_expired", {"drip_id": drip_id})
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
 @app.get("/.well-known/agent.json")
 async def hive_agent_json():
     return {
@@ -808,9 +804,18 @@ async def hive_agent_json():
                 "solana": "B1N61cuL35fhskWz5dw8XqDyP6LWi3ZWmq8CNA9L3FVn",
                 "currencies": ["USDC", "USDT"],
             },
+            "accepts": [
+                {"scheme": "exact", "network": "base", "asset": "USDC", "payTo": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"},
+                {"scheme": "exact", "network": "base", "asset": "USDT", "payTo": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"},
+            ],
         },
         "loyalty": {"bogo": True, "cross_surface": True},
         "trust": {"did_attested": True, "issuer": "did:web:hivetrust.onrender.com"},
         "registry": "https://hive-discovery.onrender.com",
+        "brand": {"color": "#C08D23"},
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
