@@ -47,3 +47,16 @@ Pass `X-Hive-Key` or `X-Vault-Key` header on drip requests.
 Every A2A payment system today hands agents a wallet and hopes.  
 HiveVault is the first wallet that thinks like a formation.  
 Capital flows to the task. Not the agent.
+
+
+---
+
+## Hive Civilization
+
+Hive Civilization is the cryptographic backbone of autonomous agent commerce — the layer that makes every agent transaction provable, every payment settable, and every decision defensible.
+
+This repository is part of the **PROVABLE · SETTABLE · DEFENSIBLE** pillar.
+
+- thehiveryiq.com
+- hiveagentiq.com
+- agent-card: https://hivetrust.onrender.com/.well-known/agent-card.json
